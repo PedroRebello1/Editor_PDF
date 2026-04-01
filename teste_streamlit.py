@@ -25,6 +25,37 @@ class CropValues:
     bottom: float
 
 
+def is_pdf_upload(uploaded_file) -> bool:
+    name = (getattr(uploaded_file, "name", "") or "").lower()
+    return name.endswith(".pdf")
+
+
+def sort_uploaded_files(uploaded_files) -> List:
+    return sorted(uploaded_files, key=lambda f: (getattr(f, "name", "") or "").casefold())
+
+
+def page_dimensions(page: PageObject) -> Tuple[float, float]:
+    llx = float(page.mediabox.left)
+    lly = float(page.mediabox.bottom)
+    urx = float(page.mediabox.right)
+    ury = float(page.mediabox.top)
+    return max(1.0, urx - llx), max(1.0, ury - lly)
+
+
+def detect_reference_page_size(uploaded_files) -> Optional[Tuple[float, float]]:
+    for up in uploaded_files:
+        if not is_pdf_upload(up):
+            continue
+        try:
+            up.seek(0)
+            reader = PdfReader(up)
+            if reader.pages:
+                return page_dimensions(reader.pages[0])
+        except Exception:
+            continue
+    return None
+
+
 def clone_page(page: PageObject) -> PageObject:
     writer = PdfWriter()
     writer.add_page(page)
@@ -48,11 +79,29 @@ def pdf_bytes_to_pages(pdf_bytes: bytes) -> List[PageObject]:
     return [clone_page(page) for page in reader.pages]
 
 
-def image_file_to_page(uploaded_file) -> PageObject:
+def image_file_to_page(uploaded_file, target_size: Optional[Tuple[float, float]] = None) -> PageObject:
     with Image.open(uploaded_file) as img:
         rgb_img = img.convert("RGB")
+
+        if target_size is not None:
+            target_w_pt, target_h_pt = target_size
+            canvas_w = max(1, int(round(target_w_pt)))
+            canvas_h = max(1, int(round(target_h_pt)))
+
+            src_w, src_h = rgb_img.size
+            scale = min(canvas_w / src_w, canvas_h / src_h)
+            new_w = max(1, int(round(src_w * scale)))
+            new_h = max(1, int(round(src_h * scale)))
+
+            resampling = Image.Resampling.LANCZOS if hasattr(Image, "Resampling") else Image.LANCZOS
+            fitted = rgb_img.resize((new_w, new_h), resampling)
+            canvas = Image.new("RGB", (canvas_w, canvas_h), color="white")
+            offset = ((canvas_w - new_w) // 2, (canvas_h - new_h) // 2)
+            canvas.paste(fitted, offset)
+            rgb_img = canvas
+
         temp = io.BytesIO()
-        rgb_img.save(temp, "PDF", resolution=100.0)
+        rgb_img.save(temp, "PDF", resolution=72.0)
         temp.seek(0)
         return PdfReader(temp).pages[0]
 
@@ -171,7 +220,7 @@ def get_viewer_component():
                 <div class="crop-handle h-w" data-dir="w"></div>
             </div>
             
-            <button id="applyBtn" style="display: none;">âœ” Apply Crop</button>
+            <button id="applyBtn" style="display: none;">Apply Crop</button>
 
             <div id="hint" style="
                 position: absolute;
@@ -540,29 +589,32 @@ def init_state() -> None:
 
 
 def build_from_uploads(pdf_files, image_files) -> Tuple[int, int, int]:
+    all_files = sort_uploaded_files([*(pdf_files or []), *(image_files or [])])
     pages: List[PageObject] = []
     skipped = 0
     ok_pdf = 0
     ok_img = 0
+    target_size = detect_reference_page_size(all_files)
 
-    for pdf_file in pdf_files:
+    for up in all_files:
         try:
-            pdf_file.seek(0)
-            reader = PdfReader(pdf_file)
-            new_pages = [clone_page(p) for p in reader.pages]
-            if new_pages:
-                pages.extend(new_pages)
-                ok_pdf += 1
+            up.seek(0)
+            if is_pdf_upload(up):
+                reader = PdfReader(up)
+                new_pages = [clone_page(p) for p in reader.pages]
+                if new_pages:
+                    pages.extend(new_pages)
+                    ok_pdf += 1
+                    if target_size is None:
+                        target_size = page_dimensions(new_pages[0])
+                else:
+                    skipped += 1
             else:
-                skipped += 1
-        except Exception:
-            skipped += 1
-
-    for img_file in image_files:
-        try:
-            img_file.seek(0)
-            pages.append(clone_page(image_file_to_page(img_file)))
-            ok_img += 1
+                img_page = clone_page(image_file_to_page(up, target_size=target_size))
+                pages.append(img_page)
+                ok_img += 1
+                if target_size is None:
+                    target_size = page_dimensions(img_page)
         except Exception:
             skipped += 1
 
@@ -580,25 +632,41 @@ def build_from_uploads(pdf_files, image_files) -> Tuple[int, int, int]:
 
 
 def append_mixed_uploaded_files(uploaded_files) -> Tuple[int, int]:
+    ordered_files = sort_uploaded_files(uploaded_files or [])
     added = 0
     skipped = 0
-    for up in uploaded_files:
-        name = (up.name or "").lower()
+    target_size: Optional[Tuple[float, float]] = None
+
+    if st.session_state.pages:
+        try:
+            target_size = page_dimensions(st.session_state.pages[0])
+        except Exception:
+            target_size = None
+
+    if target_size is None:
+        target_size = detect_reference_page_size(ordered_files)
+
+    for up in ordered_files:
         try:
             up.seek(0)
-            if name.endswith(".pdf"):
+            if is_pdf_upload(up):
                 reader = PdfReader(up)
                 new_pages = [clone_page(pg) for pg in reader.pages]
                 if new_pages:
                     st.session_state.pages.extend(new_pages)
                     st.session_state.thumbnails.extend([None] * len(new_pages))
                     added += len(new_pages)
+                    if target_size is None:
+                        target_size = page_dimensions(new_pages[0])
                 else:
                     skipped += 1
             else:
-                st.session_state.pages.append(clone_page(image_file_to_page(up)))
+                img_page = clone_page(image_file_to_page(up, target_size=target_size))
+                st.session_state.pages.append(img_page)
                 st.session_state.thumbnails.append(None)
                 added += 1
+                if target_size is None:
+                    target_size = page_dimensions(img_page)
         except Exception:
             skipped += 1
 
