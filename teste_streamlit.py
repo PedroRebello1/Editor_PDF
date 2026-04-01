@@ -2,7 +2,7 @@ import io
 import os
 import base64
 from dataclasses import dataclass
-from typing import List, Optional, Tuple
+from typing import Any, List, Optional, Tuple
 
 import streamlit as st
 import streamlit.components.v1 as components
@@ -171,7 +171,7 @@ def get_viewer_component():
                 <div class="crop-handle h-w" data-dir="w"></div>
             </div>
             
-            <button id="applyBtn" style="display: none;">✔ Apply Crop</button>
+            <button id="applyBtn" style="display: none;">âœ” Apply Crop</button>
 
             <div id="hint" style="
                 position: absolute;
@@ -211,7 +211,7 @@ def get_viewer_component():
             let tx = 0, ty = 0;
             let dragging = false, sx = 0, sy = 0;
             let cx = 0, cy = 0, cw = 0, ch = 0;
-            let cnx0 = 0.1, cny0 = 0.1, cnx1 = 0.9, cny1 = 0.9;
+            let cnx0 = 0.0, cny0 = 0.0, cnx1 = 1.0, cny1 = 1.0;
             let isResizing = false, draggingBox = false, currentHandle = null;
             let cropMode = false;
             
@@ -361,12 +361,23 @@ def get_viewer_component():
                 e.preventDefault(); e.stopPropagation();
                 
                 const r = getImageRect();
-                const nx0 = (cx - r.left) / r.width;
-                const ny0 = (cy - r.top) / r.height;
-                const nx1 = (cx + cw - r.left) / r.width;
-                const ny1 = (cy + ch - r.top) / r.height;
+                if (r.width <= 0 || r.height <= 0) return;
+
+                const nx0 = clamp((cx - r.left) / r.width, 0, 1);
+                const ny0 = clamp((cy - r.top) / r.height, 0, 1);
+                const nx1 = clamp((cx + cw - r.left) / r.width, 0, 1);
+                const ny1 = clamp((cy + ch - r.top) / r.height, 0, 1);
+
+                if ((nx1 - nx0) <= 0.001 || (ny1 - ny0) <= 0.001) return;
                 
-                sendDataToPython({ crop: [nx0, ny0, nx1, ny1] });
+                sendDataToPython({
+                    crop: [
+                        Number(nx0.toFixed(6)),
+                        Number(ny0.toFixed(6)),
+                        Number(nx1.toFixed(6)),
+                        Number(ny1.toFixed(6)),
+                    ]
+                });
             });
             
             window.addEventListener('mouseup', () => {
@@ -440,12 +451,13 @@ def get_viewer_component():
     </body>
     </html>
     """
-    comp_dir = os.path.join(os.getcwd(), ".pdf_viewer_comp")
+    script_dir = os.path.dirname(os.path.abspath(__file__)) if "__file__" in globals() else os.getcwd()
+    comp_dir = os.path.join(script_dir, ".pdf_viewer_comp")
     os.makedirs(comp_dir, exist_ok=True)
     with open(os.path.join(comp_dir, "index.html"), "w", encoding="utf-8") as f:
         f.write(html_content)
     
-    return components.declare_component("interactive_viewer", path=comp_dir)
+    return components.declare_component("interactive_viewer_v2", path=comp_dir)
 
 
 def apply_normalized_crop(page: PageObject, nx0: float, ny0: float, nx1: float, ny1: float) -> None:
@@ -477,6 +489,19 @@ def apply_normalized_crop(page: PageObject, nx0: float, ny0: float, nx1: float, 
     page.mediabox.upper_right = (new_urx, new_ury)
 
 
+def parse_crop_payload(payload: Any) -> Optional[Tuple[float, float, float, float]]:
+    if not isinstance(payload, dict):
+        return None
+    raw = payload.get("crop")
+    if not isinstance(raw, (list, tuple)) or len(raw) != 4:
+        return None
+    try:
+        nx0, ny0, nx1, ny1 = (float(raw[0]), float(raw[1]), float(raw[2]), float(raw[3]))
+    except (TypeError, ValueError):
+        return None
+    return nx0, ny0, nx1, ny1
+
+
 def push_undo_state() -> None:
     pages = st.session_state.get("pages", [])
     snapshot = pages_to_pdf_bytes(pages)
@@ -486,7 +511,11 @@ def push_undo_state() -> None:
 
 
 def mark_dirty() -> None:
-    st.session_state.is_dirty = True
+    try:
+        current = pages_to_pdf_bytes(st.session_state.get("pages", []))
+        st.session_state.is_dirty = current != st.session_state.get("saved_pdf_bytes", b"")
+    except Exception:
+        st.session_state.is_dirty = True
 
 
 def init_state() -> None:
@@ -510,17 +539,35 @@ def init_state() -> None:
         st.session_state.update_counter = 0
 
 
-def build_from_uploads(pdf_files, image_files) -> Tuple[int, int]:
+def build_from_uploads(pdf_files, image_files) -> Tuple[int, int, int]:
     pages: List[PageObject] = []
+    skipped = 0
+    ok_pdf = 0
+    ok_img = 0
 
     for pdf_file in pdf_files:
-        pdf_file.seek(0)
-        reader = PdfReader(pdf_file)
-        pages.extend(clone_page(p) for p in reader.pages)
+        try:
+            pdf_file.seek(0)
+            reader = PdfReader(pdf_file)
+            new_pages = [clone_page(p) for p in reader.pages]
+            if new_pages:
+                pages.extend(new_pages)
+                ok_pdf += 1
+            else:
+                skipped += 1
+        except Exception:
+            skipped += 1
 
     for img_file in image_files:
-        img_file.seek(0)
-        pages.append(clone_page(image_file_to_page(img_file)))
+        try:
+            img_file.seek(0)
+            pages.append(clone_page(image_file_to_page(img_file)))
+            ok_img += 1
+        except Exception:
+            skipped += 1
+
+    if not pages:
+        return 0, 0, skipped
 
     st.session_state.pages = pages
     st.session_state.thumbnails = [None] * len(pages)
@@ -529,27 +576,33 @@ def build_from_uploads(pdf_files, image_files) -> Tuple[int, int]:
     st.session_state.saved_pdf_bytes = pages_to_pdf_bytes(pages) if pages else b""
     st.session_state.is_dirty = False
     st.session_state.app_view = "editor"
-    return len(pdf_files), len(image_files)
+    return ok_pdf, ok_img, skipped
 
 
-def append_mixed_uploaded_files(uploaded_files) -> int:
+def append_mixed_uploaded_files(uploaded_files) -> Tuple[int, int]:
     added = 0
+    skipped = 0
     for up in uploaded_files:
         name = (up.name or "").lower()
-        up.seek(0)
+        try:
+            up.seek(0)
+            if name.endswith(".pdf"):
+                reader = PdfReader(up)
+                new_pages = [clone_page(pg) for pg in reader.pages]
+                if new_pages:
+                    st.session_state.pages.extend(new_pages)
+                    st.session_state.thumbnails.extend([None] * len(new_pages))
+                    added += len(new_pages)
+                else:
+                    skipped += 1
+            else:
+                st.session_state.pages.append(clone_page(image_file_to_page(up)))
+                st.session_state.thumbnails.append(None)
+                added += 1
+        except Exception:
+            skipped += 1
 
-        if name.endswith(".pdf"):
-            reader = PdfReader(up)
-            new_pages = [clone_page(pg) for pg in reader.pages]
-            st.session_state.pages.extend(new_pages)
-            st.session_state.thumbnails.extend([None] * len(new_pages))
-            added += len(new_pages)
-        else:
-            st.session_state.pages.append(clone_page(image_file_to_page(up)))
-            st.session_state.thumbnails.append(None)
-            added += 1
-
-    return added
+    return added, skipped
 
 
 def reset_to_upload_view() -> None:
@@ -771,15 +824,20 @@ def main() -> None:
             with col_u3:
                 st.write("")
                 st.write("")
-                if st.button("Create Working PDF", use_container_width=True):
+                if st.button("Create Working PDF", width="stretch"):
                     p = pdf_files or []
                     i = image_files or []
                     if not p and not i:
                         st.warning("Upload at least one PDF or image.")
                     else:
-                        n_pdf, n_img = build_from_uploads(p, i)
-                        st.success(f"Working document created from {n_pdf} PDF(s) and {n_img} image(s).")
-                        st.rerun()
+                        n_pdf, n_img, skipped = build_from_uploads(p, i)
+                        if n_pdf == 0 and n_img == 0:
+                            st.warning("No valid files were loaded. Check file integrity/format and try again.")
+                        else:
+                            st.success(f"Working document created from {n_pdf} PDF(s) and {n_img} image(s).")
+                            if skipped:
+                                st.warning(f"Skipped {skipped} invalid file(s).")
+                            st.rerun()
 
             st.markdown('</div>', unsafe_allow_html=True)
 
@@ -796,11 +854,11 @@ def main() -> None:
     st.markdown('<div class="app-navbar"><div class="app-navbar-title">Editor Actions</div></div>', unsafe_allow_html=True)
     nav_c1, nav_c2, nav_c3 = st.columns([1.0, 1.0, 1.8], gap="small")
     with nav_c1:
-        if st.button("New Working PDF", use_container_width=True, key="nav_new_working"):
+        if st.button("New Working PDF", width="stretch", key="nav_new_working"):
             reset_to_upload_view()
             st.rerun()
     with nav_c2:
-        if st.button("Save Snapshot", use_container_width=True, key="nav_save_snapshot"):
+        if st.button("Save Snapshot", width="stretch", key="nav_save_snapshot"):
             st.session_state.saved_pdf_bytes = pages_to_pdf_bytes(st.session_state.pages)
             st.session_state.is_dirty = False
             st.rerun()
@@ -811,7 +869,7 @@ def main() -> None:
             data=output_bytes,
             file_name="0_streamlit_final.pdf",
             mime="application/pdf",
-            use_container_width=True,
+            width="stretch",
             key="nav_download_pdf",
         )
 
@@ -825,11 +883,11 @@ def main() -> None:
 
         nav_a, nav_b = st.columns(2)
         with nav_a:
-            if st.button("Prev", use_container_width=True):
+            if st.button("Prev", width="stretch"):
                 go_to_page(st.session_state.page_idx - 1)
                 st.rerun()
         with nav_b:
-            if st.button("Next", use_container_width=True):
+            if st.button("Next", width="stretch"):
                 go_to_page(st.session_state.page_idx + 1)
                 st.rerun()
 
@@ -846,7 +904,7 @@ def main() -> None:
 
         c1, c2 = st.columns(2)
         with c1:
-            if st.button("Rotate Left", use_container_width=True):
+            if st.button("Rotate Left", width="stretch"):
                 push_undo_state()
                 idx = st.session_state.page_idx
                 st.session_state.pages[idx].rotate(-90)
@@ -854,7 +912,7 @@ def main() -> None:
                 mark_dirty()
                 st.rerun()
         with c2:
-            if st.button("Rotate Right", use_container_width=True):
+            if st.button("Rotate Right", width="stretch"):
                 push_undo_state()
                 idx = st.session_state.page_idx
                 st.session_state.pages[idx].rotate(90)
@@ -864,7 +922,7 @@ def main() -> None:
 
         c3, c4 = st.columns(2)
         with c3:
-            if st.button("Move Up", use_container_width=True) and st.session_state.page_idx > 0:
+            if st.button("Move Up", width="stretch") and st.session_state.page_idx > 0:
                 push_undo_state()
                 idx = st.session_state.page_idx
                 pages = st.session_state.pages
@@ -875,7 +933,7 @@ def main() -> None:
                 mark_dirty()
                 st.rerun()
         with c4:
-            if st.button("Move Down", use_container_width=True) and st.session_state.page_idx < total_pages - 1:
+            if st.button("Move Down", width="stretch") and st.session_state.page_idx < total_pages - 1:
                 push_undo_state()
                 idx = st.session_state.page_idx
                 pages = st.session_state.pages
@@ -888,7 +946,7 @@ def main() -> None:
 
         c5, c6 = st.columns(2)
         with c5:
-            if st.button("Duplicate", use_container_width=True):
+            if st.button("Duplicate", width="stretch"):
                 push_undo_state()
                 idx = st.session_state.page_idx
                 clone = clone_page(st.session_state.pages[idx])
@@ -898,7 +956,7 @@ def main() -> None:
                 mark_dirty()
                 st.rerun()
         with c6:
-            if st.button("Delete", use_container_width=True):
+            if st.button("Delete", width="stretch"):
                 if len(st.session_state.pages) == 1:
                     st.warning("Cannot delete the only page.")
                 else:
@@ -910,7 +968,7 @@ def main() -> None:
                     mark_dirty()
                     st.rerun()
 
-        if st.button("Undo", use_container_width=True):
+        if st.button("Undo", width="stretch"):
             if st.session_state.undo_stack:
                 prev_state = st.session_state.undo_stack.pop()
                 st.session_state.pages = pdf_bytes_to_pages(prev_state)
@@ -923,7 +981,7 @@ def main() -> None:
 
         st.markdown("#### Crop")
         crop_toggle_label = "Deactivate Crop Tool" if st.session_state.crop_drag_mode else "Activate Crop Tool"
-        if st.button(crop_toggle_label, use_container_width=True):
+        if st.button(crop_toggle_label, width="stretch"):
             st.session_state.crop_drag_mode = not st.session_state.crop_drag_mode
             st.rerun()
         st.caption("Adjust edges and corners on the preview.")
@@ -936,16 +994,24 @@ def main() -> None:
             key="extra_mixed_uploader",
         )
 
-        if st.button("Append Uploaded Files", use_container_width=True):
+        if st.button("Append Uploaded Files", width="stretch"):
             selected_files = mixed_files or []
             if not selected_files:
                 st.warning("No extra files selected.")
             else:
-                push_undo_state()
-                added = append_mixed_uploaded_files(selected_files)
+                before_append_snapshot = pages_to_pdf_bytes(st.session_state.pages)
+                added, skipped = append_mixed_uploaded_files(selected_files)
 
-                mark_dirty()
-                st.success(f"Added {added} page(s).")
+                if added == 0:
+                    st.warning("No pages were added from the selected files.")
+                else:
+                    st.session_state.undo_stack.append(before_append_snapshot)
+                    if len(st.session_state.undo_stack) > 40:
+                        st.session_state.undo_stack.pop(0)
+                    mark_dirty()
+                    st.success(f"Added {added} page(s).")
+                if skipped:
+                    st.warning(f"Skipped {skipped} invalid file(s).")
                 st.rerun()
 
         status_text = "Unsaved changes" if st.session_state.is_dirty else "All changes saved"
@@ -974,18 +1040,25 @@ def main() -> None:
             )
             
             # Immediately process the crop payload from JavaScript
-            if crop_result and "crop" in crop_result:
-                nx0, ny0, nx1, ny1 = crop_result["crop"]
-                push_undo_state()
-                idx = st.session_state.page_idx
-                apply_normalized_crop(st.session_state.pages[idx], nx0, ny0, nx1, ny1)
-                st.session_state.thumbnails[idx] = None
-                mark_dirty()
-                
-                # Automatically disable crop mode, force an ID change to avoid loops, and show result
-                st.session_state.crop_drag_mode = False
-                st.session_state.update_counter += 1
-                st.rerun()
+            parsed_crop = parse_crop_payload(crop_result)
+            if parsed_crop is not None:
+                nx0, ny0, nx1, ny1 = parsed_crop
+                crop_applied = False
+                try:
+                    push_undo_state()
+                    idx = st.session_state.page_idx
+                    apply_normalized_crop(st.session_state.pages[idx], nx0, ny0, nx1, ny1)
+                    st.session_state.thumbnails[idx] = None
+                    mark_dirty()
+                    crop_applied = True
+                except Exception:
+                    st.warning("Could not apply crop to this page.")
+
+                if crop_applied:
+                    # Automatically disable crop mode, force an ID change to avoid loops, and show result
+                    st.session_state.crop_drag_mode = False
+                    st.session_state.update_counter += 1
+                    st.rerun()
 
         else:
             st.warning("Install pypdfium2 for high quality page preview.")
@@ -1022,11 +1095,11 @@ def main() -> None:
                     is_active = (i == st.session_state.page_idx)
                     
                     with st.container(border=is_active):
-                        st.image(thumb, use_container_width=True)
+                        st.image(thumb, width="stretch")
                         if st.button(
                             label=f"Page {page_no}", 
                             key=f"nav_thumb_{i}", 
-                            use_container_width=True
+                            width="stretch"
                         ):
                             st.session_state.page_idx = i
                             st.rerun()
