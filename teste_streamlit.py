@@ -509,9 +509,48 @@ def get_viewer_component():
     return components.declare_component("interactive_viewer_v2", path=comp_dir)
 
 
+def _map_view_to_page_norm(nx: float, ny: float, rotation: int) -> Tuple[float, float]:
+    """Map normalized view coordinates (top-left origin) to normalized page coords.
+
+    Returns:
+        (x_norm, y_top_norm)
+    """
+    r = rotation % 360
+    if r == 0:
+        return nx, ny
+    if r == 90:
+        return ny, 1.0 - nx
+    if r == 180:
+        return 1.0 - nx, 1.0 - ny
+    if r == 270:
+        return 1.0 - ny, nx
+    return nx, ny
+
+
 def apply_normalized_crop(page: PageObject, nx0: float, ny0: float, nx1: float, ny1: float) -> None:
     nx0, nx1 = sorted((max(0.0, min(1.0, nx0)), max(0.0, min(1.0, nx1))))
     ny0, ny1 = sorted((max(0.0, min(1.0, ny0)), max(0.0, min(1.0, ny1))))
+
+    try:
+        rotation = int(page.get("/Rotate", 0) or 0) % 360
+    except Exception:
+        rotation = 0
+
+    if rotation not in (0, 90, 180, 270):
+        rotation = (round(rotation / 90.0) * 90) % 360
+
+    mapped = [
+        _map_view_to_page_norm(nx0, ny0, rotation),
+        _map_view_to_page_norm(nx1, ny0, rotation),
+        _map_view_to_page_norm(nx1, ny1, rotation),
+        _map_view_to_page_norm(nx0, ny1, rotation),
+    ]
+
+    x_vals = [p[0] for p in mapped]
+    y_top_vals = [p[1] for p in mapped]
+
+    px0, px1 = min(x_vals), max(x_vals)
+    py_top0, py_top1 = min(y_top_vals), max(y_top_vals)
 
     llx = float(page.cropbox.left)
     lly = float(page.cropbox.bottom)
@@ -524,10 +563,10 @@ def apply_normalized_crop(page: PageObject, nx0: float, ny0: float, nx1: float, 
     if width <= 0 or height <= 0:
         raise ValueError("Invalid page dimensions for crop.")
 
-    new_llx = llx + width * nx0
-    new_urx = llx + width * nx1
-    new_ury = ury - height * ny0
-    new_lly = ury - height * ny1
+    new_llx = llx + width * px0
+    new_urx = llx + width * px1
+    new_ury = ury - height * py_top0
+    new_lly = ury - height * py_top1
 
     if new_llx >= new_urx or new_lly >= new_ury:
         raise ValueError("Invalid crop area.")
